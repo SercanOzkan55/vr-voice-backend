@@ -1,10 +1,8 @@
-using Microsoft.Data.Sqlite;
 using System.Text;
 using System.Text.Json;
+using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
-
-// Unity için CORS (gerekirse kapatırız)
 builder.Services.AddCors();
 
 var app = builder.Build();
@@ -15,28 +13,64 @@ var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Urls.Clear();
 app.Urls.Add($"http://0.0.0.0:{port}");
 
-string dbPath = "cache.db";
-
-void InitDb()
+// ---------- Postgres bağlantısı ----------
+string GetPgConn()
 {
-    using var con = new SqliteConnection($"Data Source={dbPath}");
-    con.Open();
+    var url = Environment.GetEnvironmentVariable("DATABASE_URL")
+           ?? Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL");
 
-    var cmd = con.CreateCommand();
-    cmd.CommandText = @"
-CREATE TABLE IF NOT EXISTS qa_cache (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  question_norm TEXT NOT NULL,
-  answer TEXT NOT NULL,
-  expires_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_qa_question ON qa_cache(question_norm);
-";
-    cmd.ExecuteNonQuery();
+    if (!string.IsNullOrWhiteSpace(url))
+    {
+        var uri = new Uri(url);
+        var userInfo = uri.UserInfo.Split(':', 2);
+        var user = Uri.UnescapeDataString(userInfo[0]);
+        var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
+        var db = uri.AbsolutePath.TrimStart('/');
+
+        return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
+    }
+
+    var host = Environment.GetEnvironmentVariable("PGHOST");
+    var port2 = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
+    var user2 = Environment.GetEnvironmentVariable("PGUSER");
+    var pass2 = Environment.GetEnvironmentVariable("PGPASSWORD");
+    var db2 = Environment.GetEnvironmentVariable("PGDATABASE");
+
+    if (!string.IsNullOrWhiteSpace(host) && !string.IsNullOrWhiteSpace(user2) && !string.IsNullOrWhiteSpace(db2))
+        return $"Host={host};Port={port2};Database={db2};Username={user2};Password={pass2};Ssl Mode=Require;Trust Server Certificate=true;";
+
+    throw new Exception("Postgres env bulunamadı (DATABASE_URL veya PG*).");
 }
-InitDb();
 
-string Normalize(string q) => q.Trim().ToLowerInvariant();
+string pgConn = GetPgConn();
+
+// ---------- Tabloyu oluştur (app.Run() öncesi!) ----------
+await using (var conn = new NpgsqlConnection(pgConn))
+{
+    await conn.OpenAsync();
+    await using var cmd = new NpgsqlCommand(@"
+CREATE TABLE IF NOT EXISTS qa_cache (
+  id BIGSERIAL PRIMARY KEY,
+  question TEXT NOT NULL,
+  qnorm TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NULL
+);
+CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm ON qa_cache(qnorm);
+", conn);
+    await cmd.ExecuteNonQueryAsync();
+}
+
+// ---------- Helpers ----------
+string Normalize(string q)
+{
+    if (string.IsNullOrWhiteSpace(q)) return "";
+    q = q.Trim().ToLowerInvariant();
+    while (q.Contains("  ")) q = q.Replace("  ", " ");
+    return q;
+}
 
 bool IsTimeSensitive(string q)
 {
@@ -49,43 +83,48 @@ bool IsTimeSensitive(string q)
     return keywords.Any(k => x.Contains(k));
 }
 
-string? TryCache(string norm)
+async Task<string?> TryCachePg(string norm)
 {
-    using var con = new SqliteConnection($"Data Source={dbPath}");
-    con.Open();
+    await using var conn = new NpgsqlConnection(pgConn);
+    await conn.OpenAsync();
 
-    var cmd = con.CreateCommand();
-    cmd.CommandText = @"
+    await using var cmd = new NpgsqlCommand(@"
 SELECT answer, expires_at
 FROM qa_cache
-WHERE question_norm = $q
+WHERE qnorm = @q
 ORDER BY id DESC
-LIMIT 1;";
-    cmd.Parameters.AddWithValue("$q", norm);
+LIMIT 1;", conn);
 
-    using var reader = cmd.ExecuteReader();
-    if (!reader.Read()) return null;
+    cmd.Parameters.AddWithValue("@q", norm);
 
-    var expires = DateTime.Parse(reader.GetString(1));
-    if (expires < DateTime.UtcNow) return null;
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (!await reader.ReadAsync()) return null;
+
+    var expiresObj = reader.IsDBNull(1) ? null : reader.GetFieldValue<DateTime>(1);
+
+    if (expiresObj != null && expiresObj.Value < DateTime.UtcNow)
+        return null;
 
     return reader.GetString(0);
 }
 
-void SaveCache(string norm, string answer, int ttlMinutes)
+async Task SaveCachePg(string question, string norm, string answer, int ttlMinutes)
 {
-    using var con = new SqliteConnection($"Data Source={dbPath}");
-    con.Open();
+    var expires = DateTime.UtcNow.AddMinutes(ttlMinutes);
 
-    var cmd = con.CreateCommand();
-    cmd.CommandText = @"
-INSERT INTO qa_cache (question_norm, answer, expires_at)
-VALUES ($q,$a,$e);";
-    cmd.Parameters.AddWithValue("$q", norm);
-    cmd.Parameters.AddWithValue("$a", answer);
-    cmd.Parameters.AddWithValue("$e", DateTime.UtcNow.AddMinutes(ttlMinutes).ToString("o"));
+    await using var conn = new NpgsqlConnection(pgConn);
+    await conn.OpenAsync();
 
-    cmd.ExecuteNonQuery();
+    await using var cmd = new NpgsqlCommand(@"
+INSERT INTO qa_cache (question, qnorm, answer, expires_at, updated_at)
+VALUES (@question, @qnorm, @answer, @expires_at, NOW());", conn);
+
+    cmd.Parameters.AddWithValue("@question", question);
+    cmd.Parameters.AddWithValue("@qnorm", norm);
+    cmd.Parameters.AddWithValue("@answer", answer);
+    cmd.Parameters.AddWithValue("@expires_at", expires);
+
+    await cmd.ExecuteNonQueryAsync();
 }
 
 async Task<string> AskOpenAI(string question, bool useWeb)
@@ -115,7 +154,6 @@ async Task<string> AskOpenAI(string question, bool useWeb)
                 ["content"] = question
             }
         },
-        // useWeb true ise web tool'u ver
         ["tools"] = useWeb ? new object[]
         {
             new Dictionary<string, string> { ["type"] = "web_search" }
@@ -137,13 +175,13 @@ async Task<string> AskOpenAI(string question, bool useWeb)
     if (doc.RootElement.TryGetProperty("output_text", out var outText))
         return outText.GetString() ?? "";
 
-    // fallback
     return doc.RootElement.GetProperty("output")[0]
         .GetProperty("content")[0]
         .GetProperty("text")
         .GetString() ?? "";
 }
 
+// ---------- Endpoints ----------
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
 
 app.MapPost("/ask", async (HttpRequest request) =>
@@ -159,20 +197,22 @@ app.MapPost("/ask", async (HttpRequest request) =>
 
     var norm = Normalize(question);
 
-    // time-sensitive soruları cache'ten çekme (yanlış hava durumu vs istemiyorsun)
     var timeSensitive = IsTimeSensitive(question);
+
+    // Time-sensitive değilse: cache dene
     if (!timeSensitive)
     {
-        var cached = TryCache(norm);
+        var cached = await TryCachePg(norm);
         if (cached != null)
             return Results.Ok(new { answer = cached, cached = true, timeSensitive = false });
     }
 
+    // Time-sensitive ise: istersen web tool açık
     var answer = await AskOpenAI(question, useWeb: timeSensitive);
 
     // TTL: timeSensitive 10dk, değilse 30 gün
     var ttlMinutes = timeSensitive ? 10 : (60 * 24 * 30);
-    SaveCache(norm, answer, ttlMinutes);
+    await SaveCachePg(question, norm, answer, ttlMinutes);
 
     return Results.Ok(new { answer, cached = false, timeSensitive });
 });
