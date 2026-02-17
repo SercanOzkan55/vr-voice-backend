@@ -11,6 +11,9 @@ builder.Services.AddCors();
 var app = builder.Build();
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
+// ✅ BU SATIR DEPLOY LOG’DA GÖRÜNMELİ
+Console.WriteLine("BUILD_MARKER: 2026-02-18_v2");
+
 // Railway genelde PORT verir. Local’de yoksa 8080.
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Urls.Clear();
@@ -42,7 +45,7 @@ static bool IsTimeSensitive(string q)
 
 static string GetPgConn()
 {
-    // 1) URL tabanlı (Render/Railway bazen)
+    // 1) URL tabanlı env’ler
     var url = Environment.GetEnvironmentVariable("DATABASE_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PRIVATE_URL");
@@ -59,19 +62,19 @@ static string GetPgConn()
         return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
     }
 
-    // 2) PG* env fallback (Railway Postgres çoğunlukla böyle verir)
+    // 2) PG* env fallback
     var host = Environment.GetEnvironmentVariable("PGHOST");
-    var port = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
-    var dbn  = Environment.GetEnvironmentVariable("PGDATABASE");
-    var user2= Environment.GetEnvironmentVariable("PGUSER");
-    var pass2= Environment.GetEnvironmentVariable("PGPASSWORD");
+    var p = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
+    var dbn = Environment.GetEnvironmentVariable("PGDATABASE");
+    var user2 = Environment.GetEnvironmentVariable("PGUSER");
+    var pass2 = Environment.GetEnvironmentVariable("PGPASSWORD");
 
     if (!string.IsNullOrWhiteSpace(host) &&
         !string.IsNullOrWhiteSpace(dbn) &&
         !string.IsNullOrWhiteSpace(user2) &&
         !string.IsNullOrWhiteSpace(pass2))
     {
-        return $"Host={host};Port={port};Database={dbn};Username={user2};Password={pass2};Ssl Mode=Require;Trust Server Certificate=true;";
+        return $"Host={host};Port={p};Database={dbn};Username={user2};Password={pass2};Ssl Mode=Require;Trust Server Certificate=true;";
     }
 
     throw new Exception("DB env bulunamadı. (DATABASE_URL* veya PG* yok)");
@@ -207,12 +210,10 @@ catch (Exception ex)
 
 /* ---------- ENDPOINTS ---------- */
 
-// Cache / image kontrolü için: bu string geliyorsa doğru image çalışıyor demek
-app.MapGet("/version", () => Results.Ok("BUILD_2026_02_17"));
-
-app.MapGet("/", () => Results.Ok("OK"));
-
+// ✅ Bunlar 404 olmamalı. Olursa: deploy edilen kod bu değil.
+app.MapGet("/", () => "OK");
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
+app.MapGet("/version", () => "BUILD_2026_02_18_v2");
 
 app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
 {
