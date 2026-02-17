@@ -1,7 +1,7 @@
-//ol artık yeter
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Routing;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,6 +11,7 @@ builder.Services.AddCors();
 var app = builder.Build();
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
+// Railway genelde PORT verir. Local’de yoksa 8080.
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Urls.Clear();
 app.Urls.Add($"http://0.0.0.0:{port}");
@@ -41,6 +42,7 @@ static bool IsTimeSensitive(string q)
 
 static string GetPgConn()
 {
+    // 1) URL tabanlı (Render/Railway bazen)
     var url = Environment.GetEnvironmentVariable("DATABASE_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PRIVATE_URL");
@@ -57,7 +59,22 @@ static string GetPgConn()
         return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
     }
 
-    throw new Exception("DATABASE_URL bulunamadı.");
+    // 2) PG* env fallback (Railway Postgres çoğunlukla böyle verir)
+    var host = Environment.GetEnvironmentVariable("PGHOST");
+    var port = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
+    var dbn  = Environment.GetEnvironmentVariable("PGDATABASE");
+    var user2= Environment.GetEnvironmentVariable("PGUSER");
+    var pass2= Environment.GetEnvironmentVariable("PGPASSWORD");
+
+    if (!string.IsNullOrWhiteSpace(host) &&
+        !string.IsNullOrWhiteSpace(dbn) &&
+        !string.IsNullOrWhiteSpace(user2) &&
+        !string.IsNullOrWhiteSpace(pass2))
+    {
+        return $"Host={host};Port={port};Database={dbn};Username={user2};Password={pass2};Ssl Mode=Require;Trust Server Certificate=true;";
+    }
+
+    throw new Exception("DB env bulunamadı. (DATABASE_URL* veya PG* yok)");
 }
 
 static async Task EnsureDbAsync(string connString)
@@ -76,7 +93,6 @@ CREATE TABLE IF NOT EXISTS qa_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm ON qa_cache(qnorm);
 ";
-
     await using var cmd = new NpgsqlCommand(sql, conn);
     await cmd.ExecuteNonQueryAsync();
 }
@@ -177,7 +193,6 @@ static async Task<string> AskOpenAI(string question)
 }
 
 /* ---------- STARTUP ---------- */
-
 try
 {
     dbConn = GetPgConn();
@@ -187,12 +202,29 @@ try
 catch (Exception ex)
 {
     startupError = ex.Message;
-    Console.WriteLine(startupError);
+    Console.WriteLine($"DB INIT ERROR: {startupError}");
 }
 
 /* ---------- ENDPOINTS ---------- */
 
+// Cache / image kontrolü için: bu string geliyorsa doğru image çalışıyor demek
+app.MapGet("/version", () => Results.Ok("BUILD_2026_02_17"));
+
+app.MapGet("/", () => Results.Ok("OK"));
+
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
+
+app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
+{
+    var routes = sources
+        .SelectMany(s => s.Endpoints)
+        .OfType<RouteEndpoint>()
+        .Select(e => e.RoutePattern.RawText)
+        .Distinct()
+        .OrderBy(x => x);
+
+    return Results.Ok(routes);
+});
 
 app.MapGet("/dbcheck", async () =>
 {
@@ -201,6 +233,8 @@ app.MapGet("/dbcheck", async () =>
 
     try
     {
+        if (dbConn == null) return Results.Problem("dbConn null");
+
         await using var conn = new NpgsqlConnection(dbConn);
         await conn.OpenAsync();
 
@@ -215,13 +249,13 @@ app.MapGet("/dbcheck", async () =>
 app.MapPost("/ask", async (AskRequest req) =>
 {
     if (req == null || string.IsNullOrWhiteSpace(req.Question))
-        return Results.BadRequest();
+        return Results.BadRequest(new { error = "question boş" });
 
     var question = req.Question;
     var qnorm = NormalizeQ(question);
     var timeSensitive = IsTimeSensitive(question);
 
-    if (!timeSensitive && dbConn != null)
+    if (!timeSensitive && dbConn != null && startupError == null)
     {
         var cached = await TryCachePg(dbConn, qnorm);
         if (cached != null)
@@ -230,7 +264,7 @@ app.MapPost("/ask", async (AskRequest req) =>
 
     var answer = await AskOpenAI(question);
 
-    if (dbConn != null)
+    if (dbConn != null && startupError == null)
     {
         var ttl = timeSensitive ? 10 : (60 * 24 * 30);
         _ = SaveCachePg(dbConn, qnorm, question, answer, ttl);
