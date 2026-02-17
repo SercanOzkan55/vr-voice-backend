@@ -4,3 +4,10 @@ obj/
 .vs/
 *.user
 *.suo
+bin/
+obj/
+.vs/
+.vscode/
+*.db
+*.sqlite
+*.sqlite3
