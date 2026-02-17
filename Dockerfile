@@ -1,20 +1,12 @@
-# force rebuild
-# force rebuild 3
-# ---- build stage ----
+# absolute clean build
+
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
-
-COPY ["AiBackend.csproj", "./"]
-RUN dotnet restore "./AiBackend.csproj"
-
 COPY . .
-RUN dotnet publish "AiBackend.csproj" -c Release -o /app/publish --no-restore
+RUN dotnet publish -c Release -o /app
 
-# ---- runtime stage ----
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
-
+COPY --from=build /app .
 EXPOSE 8080
-COPY --from=build /app/publish .
-
 ENTRYPOINT ["dotnet", "AiBackend.dll"]
