@@ -2,18 +2,24 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 
-COPY . ./
-RUN dotnet restore ./AiBackend.csproj
-RUN dotnet publish ./AiBackend.csproj -c Release -o /app/publish --no-restore
+# Sadece projeyi kopyalayıp restore yapmak cache avantajı sağlar
+COPY ["AiBackend.csproj", "./"]
+RUN dotnet restore "./AiBackend.csproj"
+
+# Kalan tüm dosyaları kopyala ve derle
+COPY . .
+RUN dotnet publish "AiBackend.csproj" -c Release -o /app/publish --no-restore
 
 # ---- runtime stage ----
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
 WORKDIR /app
 
-# Railway/Cloud için: dışarıdan erişim
-ENV ASPNETCORE_URLS=http://0.0.0.0:8080
+# Railway/Render gibi platformlar için port ayarı
+ENV ASPNETCORE_URLS=http://*:8080
 EXPOSE 8080
 
-COPY --from=build /app/publish ./
+# Build aşamasından dosyaları tam yolunda al
+COPY --from=build /app/publish .
 
+# DLL adının büyük/küçük harf duyarlılığına dikkat (AiBackend.dll)
 ENTRYPOINT ["dotnet", "AiBackend.dll"]
