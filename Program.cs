@@ -395,12 +395,10 @@ static async Task<string?> AskOpenAI_WebSearch(string question)
         return null;
     }
 
-    // ✅ DEBUG: ilk 500 karakteri logla ki gerçekten ne dönüyor görelim
     Console.WriteLine("WEB_SEARCH_OK_JSON_FIRST500 -> " + (json.Length > 500 ? json.Substring(0, 500) : json));
 
     using var doc = JsonDocument.Parse(json);
 
-    // Responses API: output -> [ { type:"message", content:[ {type:"output_text", text:"..."} ] } ]
     if (!doc.RootElement.TryGetProperty("output", out var outputArr) || outputArr.ValueKind != JsonValueKind.Array)
         return null;
 
@@ -408,7 +406,6 @@ static async Task<string?> AskOpenAI_WebSearch(string question)
 
     foreach (var outItem in outputArr.EnumerateArray())
     {
-        // content array varsa oradan output_text topla
         if (outItem.TryGetProperty("content", out var contentArr) && contentArr.ValueKind == JsonValueKind.Array)
         {
             foreach (var c in contentArr.EnumerateArray())
@@ -421,7 +418,6 @@ static async Task<string?> AskOpenAI_WebSearch(string question)
             }
         }
 
-        // bazı varyantlarda direkt "text" alanı olabiliyor
         if (outItem.TryGetProperty("text", out var directText) && directText.ValueKind == JsonValueKind.String)
             sb.Append(directText.GetString());
     }
@@ -519,14 +515,12 @@ static async Task<string> AskOpenAI_NoWeb(string question)
 // --- Main entry for answering ---
 static async Task<string> AskOpenAI(string question)
 {
-    // time-sensitive ise önce web search dene, sonra fallback
     if (IsTimeSensitive(question))
     {
         var webAns = await AskOpenAI_WebSearch(question);
         if (!string.IsNullOrWhiteSpace(webAns))
             return webAns;
 
-        // fallback (boş dönmesin)
         return await AskOpenAI_NoWeb("Kullanıcı canlı veri soruyor (hava/kur/maç/haber). İnternete erişim yoksa uydurma yapma ve dürüstçe söyle: " + question);
     }
 
@@ -690,12 +684,12 @@ app.MapPost("/ask", async (AskRequest req) =>
     // 3) LLM (web search dahil)
     var answer = await AskOpenAI(question);
 
-    // 4) Save
-    if (dbConn != null && startupError == null)
+    // 4) Save  ✅ time-sensitive soruları ASLA kaydetme
+    if (!timeSensitive && dbConn != null && startupError == null)
     {
-        var ttl = timeSensitive ? TTL_TIME_SENSITIVE_MIN : TTL_NORMAL_MIN;
+        var ttl = TTL_NORMAL_MIN;
 
-        if (!timeSensitive && semanticEnabled && emb == null)
+        if (semanticEnabled && emb == null)
             emb = await GetEmbeddingAsync(question);
 
         await SaveCachePg(dbConn, qnorm, question, answer, ttl, emb, semanticEnabled);
