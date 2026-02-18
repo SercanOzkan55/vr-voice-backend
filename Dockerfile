@@ -1,21 +1,27 @@
-# --- build ---
+# --- Build Aşaması ---
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
+
+# Proje dosyalarını kopyala
 COPY . .
-RUN dotnet publish -c Release -o /app
 
-# --- runtime ---
+# Release modunda derle ve /app/publish klasörüne çıkar
+RUN dotnet publish -c Release -o /app/publish
+
+# --- Runtime (Çalışma) Aşaması ---
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+WORKDIR /app
 
-# libgssapi_krb5.so.2 -> libkrb5 paketiyle gelir (Debian tabanlı imajlarda)
+# SQL Client için gerekli Linux kütüphanesini yükle (Hata düzeltici kısım)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libkrb5-3 \
+    && apt-get install -y --no-install-recommends libgssapi-krb5-2 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-COPY --from=build /app .
+# Derlenen dosyaları build aşamasından al
+COPY --from=build /app/publish .
 
-ENV ASPNETCORE_URLS=http://0.0.0.0:8080
+# Portu dışarı aç
 EXPOSE 8080
 
+# Uygulamayı başlat (Senin DLL ismin AiBackend.dll görünüyor)
 ENTRYPOINT ["dotnet", "AiBackend.dll"]
