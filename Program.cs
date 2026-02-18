@@ -11,10 +11,9 @@ builder.Services.AddCors();
 var app = builder.Build();
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
-// ✅ BU SATIR DEPLOY LOG’DA GÖRÜNMELİ
-Console.WriteLine("BUILD_MARKER: 2026-02-18_v2");
+// Build marker
+Console.WriteLine("BUILD_MARKER: 2026-02-18_v3_fuzzycache");
 
-// Railway genelde PORT verir. Local’de yoksa 8080.
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Urls.Clear();
 app.Urls.Add($"http://0.0.0.0:{port}");
@@ -22,30 +21,37 @@ app.Urls.Add($"http://0.0.0.0:{port}");
 string? dbConn = null;
 string? startupError = null;
 
+const double FUZZY_SIM_THRESHOLD = 0.85; // %85 benzerlik
+const int TTL_TIME_SENSITIVE_MIN = 10;
+const int TTL_NORMAL_MIN = 60 * 24 * 30;
+
 static string NormalizeQ(string s)
 {
     if (string.IsNullOrWhiteSpace(s)) return "";
     s = s.Trim().ToLowerInvariant();
+
+    // Basit normalize: fazla boşlukları azalt
     while (s.Contains("  ")) s = s.Replace("  ", " ");
+
+    // Noktalama temizlemek istersen aç:
+    // s = new string(s.Where(ch => !char.IsPunctuation(ch)).ToArray());
+
     return s;
 }
 
 static bool IsTimeSensitive(string q)
 {
     var x = q.ToLowerInvariant();
-
     string[] keywords =
     {
         "bugün","yarın","şu an","hava","dolar","euro","kur","haber",
         "today","tomorrow","now","weather","price","news","latest"
     };
-
     return keywords.Any(k => x.Contains(k));
 }
 
 static string GetPgConn()
 {
-    // 1) URL tabanlı env’ler
     var url = Environment.GetEnvironmentVariable("DATABASE_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PRIVATE_URL");
@@ -62,7 +68,7 @@ static string GetPgConn()
         return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
     }
 
-    // 2) PG* env fallback
+    // PG* fallback
     var host = Environment.GetEnvironmentVariable("PGHOST");
     var p = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
     var dbn = Environment.GetEnvironmentVariable("PGDATABASE");
@@ -85,7 +91,10 @@ static async Task EnsureDbAsync(string connString)
     await using var conn = new NpgsqlConnection(connString);
     await conn.OpenAsync();
 
+    // pg_trgm extension (fuzzy similarity için)
     var sql = @"
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 CREATE TABLE IF NOT EXISTS qa_cache (
   id BIGSERIAL PRIMARY KEY,
   qnorm TEXT NOT NULL,
@@ -94,34 +103,77 @@ CREATE TABLE IF NOT EXISTS qa_cache (
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm ON qa_cache(qnorm);
+CREATE INDEX IF NOT EXISTS idx_qa_cache_expires ON qa_cache(expires_at);
+
+-- Fuzzy arama için GIN index (çok hızlandırır)
+CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm_trgm ON qa_cache USING gin (qnorm gin_trgm_ops);
 ";
     await using var cmd = new NpgsqlCommand(sql, conn);
     await cmd.ExecuteNonQueryAsync();
 }
 
-static async Task<string?> TryCachePg(string connString, string qnorm)
+static async Task<(string? answer, bool hit, double sim, string? matchedQnorm)> TryCachePgExactOrFuzzy(
+    string connString, string qnorm, double threshold)
 {
     try
     {
         await using var conn = new NpgsqlConnection(connString);
         await conn.OpenAsync();
 
-        var sql = @"SELECT answer, expires_at FROM qa_cache WHERE qnorm=@q ORDER BY id DESC LIMIT 1;";
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@q", qnorm);
+        // 1) Önce exact (en hızlı / en doğru)
+        {
+            var sql = @"SELECT answer, expires_at, qnorm FROM qa_cache
+                        WHERE qnorm=@q
+                        ORDER BY id DESC LIMIT 1;";
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@q", qnorm);
 
-        await using var reader = await cmd.ExecuteReaderAsync();
-        if (!await reader.ReadAsync()) return null;
+            await using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                var expires = reader.GetDateTime(1);
+                if (expires.ToUniversalTime() >= DateTime.UtcNow)
+                {
+                    return (reader.GetString(0), true, 1.0, reader.GetString(2));
+                }
+            }
+        }
 
-        var expires = reader.GetDateTime(1);
-        if (expires.ToUniversalTime() < DateTime.UtcNow) return null;
+        // 2) Fuzzy (pg_trgm similarity)
+        {
+            var sql = @"
+SELECT answer, expires_at, qnorm, similarity(qnorm, @q) AS sim
+FROM qa_cache
+WHERE expires_at > NOW()
+ORDER BY sim DESC, id DESC
+LIMIT 1;
+";
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@q", qnorm);
 
-        return reader.GetString(0);
+            await using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return (null, false, 0, null);
+
+            var answer = reader.GetString(0);
+            var expires = reader.GetDateTime(1);
+            var matched = reader.GetString(2);
+            var sim = reader.GetDouble(3);
+
+            if (expires.ToUniversalTime() < DateTime.UtcNow) return (null, false, 0, null);
+
+            if (sim >= threshold)
+            {
+                return (answer, true, sim, matched);
+            }
+
+            return (null, false, sim, matched);
+        }
     }
     catch
     {
-        return null;
+        return (null, false, 0, null);
     }
 }
 
@@ -210,10 +262,9 @@ catch (Exception ex)
 
 /* ---------- ENDPOINTS ---------- */
 
-// ✅ Bunlar 404 olmamalı. Olursa: deploy edilen kod bu değil.
 app.MapGet("/", () => "OK");
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
-app.MapGet("/version", () => "BUILD_2026_02_18_v2");
+app.MapGet("/version", () => "BUILD_2026_02_18_v3_fuzzycache");
 
 app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
 {
@@ -256,19 +307,34 @@ app.MapPost("/ask", async (AskRequest req) =>
     var qnorm = NormalizeQ(question);
     var timeSensitive = IsTimeSensitive(question);
 
+    // ✅ Cache: exact + fuzzy
     if (!timeSensitive && dbConn != null && startupError == null)
     {
-        var cached = await TryCachePg(dbConn, qnorm);
-        if (cached != null)
-            return Results.Ok(new { answer = cached, cached = true });
+        var cached = await TryCachePgExactOrFuzzy(dbConn, qnorm, FUZZY_SIM_THRESHOLD);
+        if (cached.hit && cached.answer != null)
+        {
+            return Results.Ok(new
+            {
+                answer = cached.answer,
+                cached = true,
+                fuzzy = cached.sim < 0.999,
+                similarity = cached.sim,
+                matched = cached.matchedQnorm
+            });
+        }
     }
 
+    // OpenAI
     var answer = await AskOpenAI(question);
 
-    if (dbConn != null && startupError == null)
+    // ✅ Eğer timeSensitive değilse ve DB varsa kaydet
+    if (!timeSensitive && dbConn != null && startupError == null)
     {
-        var ttl = timeSensitive ? 10 : (60 * 24 * 30);
-        _ = SaveCachePg(dbConn, qnorm, question, answer, ttl);
+        _ = SaveCachePg(dbConn, qnorm, question, answer, TTL_NORMAL_MIN);
+    }
+    else if (timeSensitive && dbConn != null && startupError == null)
+    {
+        _ = SaveCachePg(dbConn, qnorm, question, answer, TTL_TIME_SENSITIVE_MIN);
     }
 
     return Results.Ok(new { answer, cached = false });
