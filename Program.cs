@@ -1,10 +1,11 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Routing;
 using Npgsql;
-using System.Diagnostics;
-using Pgvector; // ✅ IMPORTANT: Pgvector NuGet package
+using Pgvector;
+using Pgvector.Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -13,26 +14,35 @@ builder.Services.AddCors();
 var app = builder.Build();
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
-// Build marker
-Console.WriteLine("BUILD_MARKER: 2026-02-18_v4_semanticcache");
+Console.WriteLine("BUILD_MARKER: 2026-02-18_v6_semanticcache_FULL");
 
+// Bind to Railway PORT
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
 app.Urls.Clear();
 app.Urls.Add($"http://0.0.0.0:{port}");
 
+// --- Config ---
 string? dbConn = null;
 string? startupError = null;
 
-// --- Cache thresholds (konservatif / agresif değil) ---
 const double FUZZY_SIM_THRESHOLD = 0.85;   // pg_trgm similarity
-const double SEMANTIC_COSINE_MIN = 0.90;   // embedding cosine similarity
-const double OVERLAP_MIN = 0.35;           // ana kelime overlap güvenliği
+const double SEMANTIC_COSINE_MIN = 0.90;   // cosine similarity
+const double OVERLAP_MIN = 0.35;           // keyword overlap guard
 
 const int TTL_TIME_SENSITIVE_MIN = 10;
 const int TTL_NORMAL_MIN = 60 * 24 * 30;
 
-// Embedding boyutu (text-embedding-3-small -> 1536)
+// text-embedding-3-small -> 1536
 const int EMB_DIM = 1536;
+
+// Stopwords (top-level field yok; var ile)
+var Stop = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+{
+    "ve","ile","ama","fakat","şu","bu","o","bir","de","da","mi","mı","mu","mü",
+    "nasıl","nedir","ne","kaç","için","tarif","tarifi","yapılır","yapımı",
+    "lütfen","kısaca","tek","cümleyle","açıkla","anlat","eder","midir","mıydı",
+    "ben","sen","o","biz","siz","onlar","şey","gibi","çok","az"
+};
 
 static string NormalizeQ(string s)
 {
@@ -55,14 +65,14 @@ static bool IsTimeSensitive(string q)
 
 static string GetPgConn()
 {
-    // 1) DATABASE_URL varsa: ya postgres://... ya da direkt connection string olabilir
+    // Railway / env priority
     var url = Environment.GetEnvironmentVariable("DATABASE_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PRIVATE_URL");
 
     if (!string.IsNullOrWhiteSpace(url))
     {
-        // Eğer postgres:// ile başlıyorsa parse et
+        // postgres://... parse
         if (url.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
             url.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
         {
@@ -76,11 +86,11 @@ static string GetPgConn()
             return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
         }
 
-        // Değilse: user direkt "Host=...;Port=..." gibi koymuş olabilir → aynen kullan
+        // already "Host=...;Port=..." etc
         return url;
     }
 
-    // 2) PG* fallback
+    // PG* fallback
     var host = Environment.GetEnvironmentVariable("PGHOST");
     var p = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
     var dbn = Environment.GetEnvironmentVariable("PGDATABASE");
@@ -98,16 +108,15 @@ static string GetPgConn()
     throw new Exception("DB env bulunamadı. (DATABASE_URL* veya PG* yok)");
 }
 
-// --- Stopwords + overlap guard (agresif reuse engeli) ---
-static readonly HashSet<string> Stop = new(StringComparer.OrdinalIgnoreCase)
+// pgvector mapping garanti
+static NpgsqlDataSource BuildDataSource(string connString)
 {
-    "ve","ile","ama","fakat","şu","bu","o","bir","de","da","mi","mı","mu","mü",
-    "nasıl","nedir","ne","kaç","için","tarif","tarifi","yapılır","yapımı",
-    "lütfen","kısaca","tek","cümleyle","açıkla","anlat","eder","midir","mıydı",
-    "ben","sen","o","biz","siz","onlar","şey","gibi","çok","az"
-};
+    var b = new NpgsqlDataSourceBuilder(connString);
+    b.UseVector();
+    return b.Build();
+}
 
-static IEnumerable<string> KeyTerms(string s)
+IEnumerable<string> KeyTerms(string s)
 {
     if (string.IsNullOrWhiteSpace(s)) yield break;
 
@@ -134,12 +143,16 @@ static double JaccardDistinct(IEnumerable<string> a, IEnumerable<string> b)
     return uni == 0 ? 0 : (double)inter / uni;
 }
 
-// --- OpenAI Embedding (ML kısmı) ---
+static string? GetOpenAIKey()
+{
+    return Environment.GetEnvironmentVariable("OPENAI_API_KEY")
+        ?? Environment.GetEnvironmentVariable("OPENAI_KEY");
+}
+
+// --- Embedding ---
 static async Task<float[]?> GetEmbeddingAsync(string text)
 {
-    var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
-              ?? Environment.GetEnvironmentVariable("OPENAI_KEY");
-
+    var apiKey = GetOpenAIKey();
     if (string.IsNullOrWhiteSpace(apiKey)) return null;
 
     using var http = new HttpClient();
@@ -153,6 +166,7 @@ static async Task<float[]?> GetEmbeddingAsync(string text)
 
     var res = await http.PostAsJsonAsync("https://api.openai.com/v1/embeddings", payload);
     var json = await res.Content.ReadAsStringAsync();
+
     if (!res.IsSuccessStatusCode)
     {
         Console.WriteLine("EMBED_FAIL -> " + res.StatusCode + " " + json);
@@ -176,8 +190,8 @@ static async Task<float[]?> GetEmbeddingAsync(string text)
 
 static async Task EnsureDbAsync(string connString)
 {
-    await using var conn = new NpgsqlConnection(connString);
-    await conn.OpenAsync();
+    await using var ds = BuildDataSource(connString);
+    await using var conn = await ds.OpenConnectionAsync();
 
     var sql = $@"
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -195,10 +209,8 @@ CREATE TABLE IF NOT EXISTS qa_cache (
 
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm ON qa_cache(qnorm);
 CREATE INDEX IF NOT EXISTS idx_qa_cache_expires ON qa_cache(expires_at);
-
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm_trgm ON qa_cache USING gin (qnorm gin_trgm_ops);
 
--- IVFFLAT index: embedding dolmadan da oluşturulabilir (NULL'lar sorun değil)
 CREATE INDEX IF NOT EXISTS idx_qa_cache_embedding
 ON qa_cache USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 ";
@@ -206,18 +218,19 @@ ON qa_cache USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
     await cmd.ExecuteNonQueryAsync();
 }
 
-// --- Cache: exact + fuzzy (pg_trgm) ---
+// --- exact + fuzzy ---
 static async Task<(string? answer, bool hit, double sim, string? matchedQnorm)> TryCachePgExactOrFuzzy(
     string connString, string qnorm, double threshold)
 {
     try
     {
-        await using var conn = new NpgsqlConnection(connString);
-        await conn.OpenAsync();
+        await using var ds = BuildDataSource(connString);
+        await using var conn = await ds.OpenConnectionAsync();
 
-        // 1) exact
+        // exact
         {
-            var sql = @"SELECT answer, expires_at, qnorm FROM qa_cache
+            var sql = @"SELECT answer, expires_at, qnorm
+                        FROM qa_cache
                         WHERE qnorm=@q
                         ORDER BY id DESC LIMIT 1;";
             await using var cmd = new NpgsqlCommand(sql, conn);
@@ -228,21 +241,18 @@ static async Task<(string? answer, bool hit, double sim, string? matchedQnorm)> 
             {
                 var expires = reader.GetDateTime(1);
                 if (expires.ToUniversalTime() >= DateTime.UtcNow)
-                {
                     return (reader.GetString(0), true, 1.0, reader.GetString(2));
-                }
             }
         }
 
-        // 2) fuzzy
+        // fuzzy
         {
             var sql = @"
 SELECT answer, expires_at, qnorm, similarity(qnorm, @q) AS sim
 FROM qa_cache
 WHERE expires_at > NOW()
 ORDER BY sim DESC, id DESC
-LIMIT 1;
-";
+LIMIT 1;";
             await using var cmd = new NpgsqlCommand(sql, conn);
             cmd.Parameters.AddWithValue("@q", qnorm);
 
@@ -256,9 +266,7 @@ LIMIT 1;
 
             if (expires.ToUniversalTime() < DateTime.UtcNow) return (null, false, 0, null);
 
-            if (sim >= threshold)
-                return (answer, true, sim, matched);
-
+            if (sim >= threshold) return (answer, true, sim, matched);
             return (null, false, sim, matched);
         }
     }
@@ -269,14 +277,14 @@ LIMIT 1;
     }
 }
 
-// --- Cache: semantic (pgvector cosine) + overlap guard ---
+// --- semantic cosine + overlap ---
 static async Task<(string? answer, bool hit, long? id, double cosine, double overlap, string? matchedQuestion)>
-TryCachePgSemantic(string connString, string question, float[] emb)
+TryCachePgSemantic(string connString, string question, float[] emb, Func<string, IEnumerable<string>> keyTerms)
 {
     try
     {
-        await using var conn = new NpgsqlConnection(connString);
-        await conn.OpenAsync();
+        await using var ds = BuildDataSource(connString);
+        await using var conn = await ds.OpenConnectionAsync();
 
         var qnorm = NormalizeQ(question);
 
@@ -288,15 +296,14 @@ WHERE embedding IS NOT NULL
   AND expires_at > NOW()
   AND similarity(qnorm, @q) >= 0.55
 ORDER BY cosine_sim DESC
-LIMIT 25;
-";
+LIMIT 25;";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@q", qnorm);
-        cmd.Parameters.AddWithValue("@emb", new Vector(emb)); // ✅ correct pgvector param
+        cmd.Parameters.AddWithValue("@emb", new Vector(emb));
 
         await using var reader = await cmd.ExecuteReaderAsync();
 
-        var qTerms = KeyTerms(question).ToArray();
+        var qTerms = keyTerms(question).ToArray();
 
         long bestId = 0;
         string? bestAns = null;
@@ -314,9 +321,8 @@ LIMIT 25;
 
             if (cosine < SEMANTIC_COSINE_MIN) continue;
 
-            var cTerms = KeyTerms(candQ).ToArray();
+            var cTerms = keyTerms(candQ).ToArray();
             var overlap = JaccardDistinct(qTerms, cTerms);
-
             if (overlap < OVERLAP_MIN) continue;
 
             var score = (0.75 * cosine) + (0.25 * overlap);
@@ -344,13 +350,13 @@ LIMIT 25;
     }
 }
 
-// --- Save (embedding ile) ---
+// --- save ---
 static async Task SaveCachePg(string connString, string qnorm, string question, string answer, int ttlMinutes, float[]? emb)
 {
     try
     {
-        await using var conn = new NpgsqlConnection(connString);
-        await conn.OpenAsync();
+        await using var ds = BuildDataSource(connString);
+        await using var conn = await ds.OpenConnectionAsync();
 
         var expires = DateTime.UtcNow.AddMinutes(ttlMinutes);
 
@@ -366,10 +372,9 @@ static async Task SaveCachePg(string connString, string qnorm, string question, 
         if (emb == null)
             cmd.Parameters.AddWithValue("@emb", DBNull.Value);
         else
-            cmd.Parameters.AddWithValue("@emb", new Vector(emb)); // ✅ correct
+            cmd.Parameters.AddWithValue("@emb", new Vector(emb));
 
         await cmd.ExecuteNonQueryAsync();
-
         Console.WriteLine($"CACHE_SAVE_OK -> {qnorm} (emb={(emb != null ? "yes" : "no")})");
     }
     catch (Exception ex)
@@ -380,11 +385,9 @@ static async Task SaveCachePg(string connString, string qnorm, string question, 
 
 static async Task<string> AskOpenAI(string question)
 {
-    var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")
-              ?? Environment.GetEnvironmentVariable("OPENAI_KEY");
-
+    var apiKey = GetOpenAIKey();
     if (string.IsNullOrWhiteSpace(apiKey))
-        return "OPENAI_API_KEY tanımlı değil.";
+        return "OPENAI_API_KEY / OPENAI_KEY tanımlı değil.";
 
     using var http = new HttpClient();
     http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
@@ -412,11 +415,7 @@ static async Task<string> AskOpenAI(string question)
         if (!doc.RootElement.TryGetProperty("choices", out var choices))
             return "choices yok";
 
-        var content = choices[0]
-            .GetProperty("message")
-            .GetProperty("content")
-            .GetString();
-
+        var content = choices[0].GetProperty("message").GetProperty("content").GetString();
         return content ?? "boş cevap";
     }
     catch (Exception ex)
@@ -438,16 +437,15 @@ catch (Exception ex)
     Console.WriteLine($"DB INIT ERROR: {startupError}");
 }
 
-/* ---------- ENDPOINTS ---------- */
+/* ---------- ROUTES ---------- */
 
 app.MapGet("/", () => "OK");
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
-app.MapGet("/version", () => "BUILD_2026_02_18_v4_semanticcache");
+app.MapGet("/version", () => "BUILD_2026_02_18_v6_semanticcache_FULL");
 
 app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
 {
-    var routes = sources
-        .SelectMany(s => s.Endpoints)
+    var routes = sources.SelectMany(s => s.Endpoints)
         .OfType<RouteEndpoint>()
         .Select(e => e.RoutePattern.RawText)
         .Distinct()
@@ -458,22 +456,54 @@ app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
 
 app.MapGet("/dbcheck", async () =>
 {
-    if (startupError != null)
-        return Results.Problem(startupError);
+    if (startupError != null) return Results.Problem(startupError);
+    if (dbConn == null) return Results.Problem("dbConn null");
 
     try
     {
-        if (dbConn == null) return Results.Problem("dbConn null");
-
-        await using var conn = new NpgsqlConnection(dbConn);
-        await conn.OpenAsync();
-
+        await using var ds = BuildDataSource(dbConn);
+        await using var conn = await ds.OpenConnectionAsync();
         return Results.Ok(new { ok = true });
     }
     catch (Exception ex)
     {
         return Results.Problem(ex.Message);
     }
+});
+
+// Debug helpers
+app.MapGet("/cache/count", async () =>
+{
+    if (startupError != null) return Results.Problem(startupError);
+    if (dbConn == null) return Results.Problem("dbConn null");
+
+    await using var ds = BuildDataSource(dbConn);
+    await using var conn = await ds.OpenConnectionAsync();
+    await using var cmd = new NpgsqlCommand("SELECT COUNT(*) FROM qa_cache;", conn);
+    var count = (long)(await cmd.ExecuteScalarAsync()!);
+    return Results.Ok(new { count });
+});
+
+app.MapGet("/cache/last", async () =>
+{
+    if (startupError != null) return Results.Problem(startupError);
+    if (dbConn == null) return Results.Problem("dbConn null");
+
+    await using var ds = BuildDataSource(dbConn);
+    await using var conn = await ds.OpenConnectionAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT id, qnorm, created_at, expires_at, (embedding IS NOT NULL) AS has_emb FROM qa_cache ORDER BY id DESC LIMIT 1;",
+        conn);
+    await using var r = await cmd.ExecuteReaderAsync();
+    if (!await r.ReadAsync()) return Results.NotFound();
+    return Results.Ok(new
+    {
+        id = r.GetInt64(0),
+        qnorm = r.GetString(1),
+        created_at = r.GetDateTime(2),
+        expires_at = r.GetDateTime(3),
+        has_embedding = r.GetBoolean(4)
+    });
 });
 
 app.MapPost("/ask", async (AskRequest req) =>
@@ -487,7 +517,7 @@ app.MapPost("/ask", async (AskRequest req) =>
     var qnorm = NormalizeQ(question);
     var timeSensitive = IsTimeSensitive(question);
 
-    // 1) Cache: exact + fuzzy
+    // 1) exact + fuzzy
     if (!timeSensitive && dbConn != null && startupError == null)
     {
         var cached = await TryCachePgExactOrFuzzy(dbConn, qnorm, FUZZY_SIM_THRESHOLD);
@@ -508,13 +538,13 @@ app.MapPost("/ask", async (AskRequest req) =>
 
     float[]? emb = null;
 
-    // 2) Cache: semantic
+    // 2) semantic
     if (!timeSensitive && dbConn != null && startupError == null)
     {
         emb = await GetEmbeddingAsync(question);
         if (emb != null)
         {
-            var sem = await TryCachePgSemantic(dbConn, question, emb);
+            var sem = await TryCachePgSemantic(dbConn, question, emb, KeyTerms);
             if (sem.hit && sem.answer != null)
             {
                 sw.Stop();
@@ -536,12 +566,11 @@ app.MapPost("/ask", async (AskRequest req) =>
     // 3) LLM
     var answer = await AskOpenAI(question);
 
-    // 4) Save (embedding ile)
+    // 4) Save
     if (dbConn != null && startupError == null)
     {
         var ttl = timeSensitive ? TTL_TIME_SENSITIVE_MIN : TTL_NORMAL_MIN;
 
-        // Time-sensitive sorularda embedding çıkarma → token maliyeti azalt
         if (!timeSensitive && emb == null)
             emb = await GetEmbeddingAsync(question);
 

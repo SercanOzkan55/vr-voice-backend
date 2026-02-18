@@ -1,13 +1,16 @@
 bin/
 obj/
-*.db
-.vs/
-*.user
-*.suo
-bin/
-obj/
 .vs/
 .vscode/
+*.user
+*.suo
+*.cache
 *.db
-*.sqlite
-*.sqlite3
+*.log
+
+# secrets
+.env
+appsettings.*.json
+
+# publish output
+out/
