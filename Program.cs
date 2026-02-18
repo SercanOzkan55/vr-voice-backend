@@ -14,7 +14,7 @@ builder.Services.AddCors();
 var app = builder.Build();
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
-Console.WriteLine("BUILD_MARKER: 2026-02-18_v6_semanticcache_FULL");
+Console.WriteLine("BUILD_MARKER: 2026-02-18_v7_semanticcache_VECTOR_FALLBACK");
 
 // Bind to Railway PORT
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
@@ -24,6 +24,7 @@ app.Urls.Add($"http://0.0.0.0:{port}");
 // --- Config ---
 string? dbConn = null;
 string? startupError = null;
+bool semanticEnabled = false; // pgvector varsa true olacak
 
 const double FUZZY_SIM_THRESHOLD = 0.85;   // pg_trgm similarity
 const double SEMANTIC_COSINE_MIN = 0.90;   // cosine similarity
@@ -35,7 +36,6 @@ const int TTL_NORMAL_MIN = 60 * 24 * 30;
 // text-embedding-3-small -> 1536
 const int EMB_DIM = 1536;
 
-// Stopwords (top-level field yok; var ile)
 var Stop = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
     "ve","ile","ama","fakat","şu","bu","o","bir","de","da","mi","mı","mu","mü",
@@ -65,14 +65,12 @@ static bool IsTimeSensitive(string q)
 
 static string GetPgConn()
 {
-    // Railway / env priority
     var url = Environment.GetEnvironmentVariable("DATABASE_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PRIVATE_URL");
 
     if (!string.IsNullOrWhiteSpace(url))
     {
-        // postgres://... parse
         if (url.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
             url.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
         {
@@ -86,11 +84,9 @@ static string GetPgConn()
             return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
         }
 
-        // already "Host=...;Port=..." etc
         return url;
     }
 
-    // PG* fallback
     var host = Environment.GetEnvironmentVariable("PGHOST");
     var p = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
     var dbn = Environment.GetEnvironmentVariable("PGDATABASE");
@@ -108,10 +104,10 @@ static string GetPgConn()
     throw new Exception("DB env bulunamadı. (DATABASE_URL* veya PG* yok)");
 }
 
-// pgvector mapping garanti
 static NpgsqlDataSource BuildDataSource(string connString)
 {
     var b = new NpgsqlDataSourceBuilder(connString);
+    // client-side mapping; extension olmasa bile problem değil
     b.UseVector();
     return b.Build();
 }
@@ -158,11 +154,7 @@ static async Task<float[]?> GetEmbeddingAsync(string text)
     using var http = new HttpClient();
     http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
-    var payload = new
-    {
-        model = "text-embedding-3-small",
-        input = text
-    };
+    var payload = new { model = "text-embedding-3-small", input = text };
 
     var res = await http.PostAsJsonAsync("https://api.openai.com/v1/embeddings", payload);
     var json = await res.Content.ReadAsStringAsync();
@@ -188,21 +180,27 @@ static async Task<float[]?> GetEmbeddingAsync(string text)
     return emb;
 }
 
-static async Task EnsureDbAsync(string connString)
+static async Task<bool> HasVectorAsync(NpgsqlConnection conn)
+{
+    const string sql = "SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name='vector');";
+    await using var cmd = new NpgsqlCommand(sql, conn);
+    return (bool)(await cmd.ExecuteScalarAsync()!);
+}
+
+static async Task EnsureDbAsync(string connString, Action<bool> setSemanticEnabled)
 {
     await using var ds = BuildDataSource(connString);
     await using var conn = await ds.OpenConnectionAsync();
 
-    var sql = $@"
+    // Her DB'de çalışacak kısım
+    var baseSql = @"
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS qa_cache (
   id BIGSERIAL PRIMARY KEY,
   qnorm TEXT NOT NULL,
   question TEXT NOT NULL,
   answer TEXT NOT NULL,
-  embedding vector({EMB_DIM}),
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -210,12 +208,29 @@ CREATE TABLE IF NOT EXISTS qa_cache (
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm ON qa_cache(qnorm);
 CREATE INDEX IF NOT EXISTS idx_qa_cache_expires ON qa_cache(expires_at);
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm_trgm ON qa_cache USING gin (qnorm gin_trgm_ops);
+";
+    await using (var cmd = new NpgsqlCommand(baseSql, conn))
+        await cmd.ExecuteNonQueryAsync();
+
+    // Vector var mı?
+    var hasVector = await HasVectorAsync(conn);
+    setSemanticEnabled(hasVector);
+    Console.WriteLine("PGVECTOR_AVAILABLE -> " + hasVector);
+
+    if (!hasVector) return;
+
+    // Vector varsa semantic kolon + index
+    var vecSql = $@"
+CREATE EXTENSION IF NOT EXISTS vector;
+
+ALTER TABLE qa_cache
+ADD COLUMN IF NOT EXISTS embedding vector({EMB_DIM});
 
 CREATE INDEX IF NOT EXISTS idx_qa_cache_embedding
 ON qa_cache USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 ";
-    await using var cmd = new NpgsqlCommand(sql, conn);
-    await cmd.ExecuteNonQueryAsync();
+    await using (var cmd2 = new NpgsqlCommand(vecSql, conn))
+        await cmd2.ExecuteNonQueryAsync();
 }
 
 // --- exact + fuzzy ---
@@ -351,7 +366,7 @@ LIMIT 25;";
 }
 
 // --- save ---
-static async Task SaveCachePg(string connString, string qnorm, string question, string answer, int ttlMinutes, float[]? emb)
+static async Task SaveCachePg(string connString, string qnorm, string question, string answer, int ttlMinutes, float[]? emb, bool semanticEnabled)
 {
     try
     {
@@ -360,22 +375,30 @@ static async Task SaveCachePg(string connString, string qnorm, string question, 
 
         var expires = DateTime.UtcNow.AddMinutes(ttlMinutes);
 
-        var sql = @"INSERT INTO qa_cache (qnorm, question, answer, embedding, expires_at)
-                    VALUES (@qnorm,@question,@answer,@emb,@expires);";
+        if (!semanticEnabled || emb == null)
+        {
+            var sql = @"INSERT INTO qa_cache (qnorm, question, answer, expires_at)
+                        VALUES (@qnorm,@question,@answer,@expires);";
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@qnorm", qnorm);
+            cmd.Parameters.AddWithValue("@question", question);
+            cmd.Parameters.AddWithValue("@answer", answer);
+            cmd.Parameters.AddWithValue("@expires", expires);
+            await cmd.ExecuteNonQueryAsync();
+            Console.WriteLine($"CACHE_SAVE_OK -> {qnorm} (emb=no)");
+            return;
+        }
 
-        await using var cmd = new NpgsqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@qnorm", qnorm);
-        cmd.Parameters.AddWithValue("@question", question);
-        cmd.Parameters.AddWithValue("@answer", answer);
-        cmd.Parameters.AddWithValue("@expires", expires);
-
-        if (emb == null)
-            cmd.Parameters.AddWithValue("@emb", DBNull.Value);
-        else
-            cmd.Parameters.AddWithValue("@emb", new Vector(emb));
-
-        await cmd.ExecuteNonQueryAsync();
-        Console.WriteLine($"CACHE_SAVE_OK -> {qnorm} (emb={(emb != null ? "yes" : "no")})");
+        var sql2 = @"INSERT INTO qa_cache (qnorm, question, answer, embedding, expires_at)
+                     VALUES (@qnorm,@question,@answer,@emb,@expires);";
+        await using var cmd2 = new NpgsqlCommand(sql2, conn);
+        cmd2.Parameters.AddWithValue("@qnorm", qnorm);
+        cmd2.Parameters.AddWithValue("@question", question);
+        cmd2.Parameters.AddWithValue("@answer", answer);
+        cmd2.Parameters.AddWithValue("@emb", new Vector(emb));
+        cmd2.Parameters.AddWithValue("@expires", expires);
+        await cmd2.ExecuteNonQueryAsync();
+        Console.WriteLine($"CACHE_SAVE_OK -> {qnorm} (emb=yes)");
     }
     catch (Exception ex)
     {
@@ -428,7 +451,7 @@ static async Task<string> AskOpenAI(string question)
 try
 {
     dbConn = GetPgConn();
-    await EnsureDbAsync(dbConn);
+    await EnsureDbAsync(dbConn, v => semanticEnabled = v);
     Console.WriteLine("DB OK");
 }
 catch (Exception ex)
@@ -440,8 +463,8 @@ catch (Exception ex)
 /* ---------- ROUTES ---------- */
 
 app.MapGet("/", () => "OK");
-app.MapGet("/health", () => Results.Ok(new { ok = true }));
-app.MapGet("/version", () => "BUILD_2026_02_18_v6_semanticcache_FULL");
+app.MapGet("/health", () => Results.Ok(new { ok = true, semanticEnabled }));
+app.MapGet("/version", () => "BUILD_2026_02_18_v7_semanticcache_VECTOR_FALLBACK");
 
 app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
 {
@@ -463,7 +486,7 @@ app.MapGet("/dbcheck", async () =>
     {
         await using var ds = BuildDataSource(dbConn);
         await using var conn = await ds.OpenConnectionAsync();
-        return Results.Ok(new { ok = true });
+        return Results.Ok(new { ok = true, semanticEnabled });
     }
     catch (Exception ex)
     {
@@ -471,7 +494,6 @@ app.MapGet("/dbcheck", async () =>
     }
 });
 
-// Debug helpers
 app.MapGet("/cache/count", async () =>
 {
     if (startupError != null) return Results.Problem(startupError);
@@ -491,9 +513,22 @@ app.MapGet("/cache/last", async () =>
 
     await using var ds = BuildDataSource(dbConn);
     await using var conn = await ds.OpenConnectionAsync();
-    await using var cmd = new NpgsqlCommand(
-        "SELECT id, qnorm, created_at, expires_at, (embedding IS NOT NULL) AS has_emb FROM qa_cache ORDER BY id DESC LIMIT 1;",
-        conn);
+
+    // embedding kolonu yoksa patlamasın diye INFORMATION_SCHEMA ile kontrol edelim
+    var hasEmbColSql = @"
+SELECT EXISTS(
+  SELECT 1
+  FROM information_schema.columns
+  WHERE table_name='qa_cache' AND column_name='embedding'
+);";
+    await using var chk = new NpgsqlCommand(hasEmbColSql, conn);
+    var hasEmbCol = (bool)(await chk.ExecuteScalarAsync()!);
+
+    var sql = hasEmbCol
+        ? "SELECT id, qnorm, created_at, expires_at, (embedding IS NOT NULL) AS has_emb FROM qa_cache ORDER BY id DESC LIMIT 1;"
+        : "SELECT id, qnorm, created_at, expires_at, false AS has_emb FROM qa_cache ORDER BY id DESC LIMIT 1;";
+
+    await using var cmd = new NpgsqlCommand(sql, conn);
     await using var r = await cmd.ExecuteReaderAsync();
     if (!await r.ReadAsync()) return Results.NotFound();
     return Results.Ok(new
@@ -502,7 +537,8 @@ app.MapGet("/cache/last", async () =>
         qnorm = r.GetString(1),
         created_at = r.GetDateTime(2),
         expires_at = r.GetDateTime(3),
-        has_embedding = r.GetBoolean(4)
+        has_embedding = r.GetBoolean(4),
+        semanticEnabled
     });
 });
 
@@ -538,8 +574,8 @@ app.MapPost("/ask", async (AskRequest req) =>
 
     float[]? emb = null;
 
-    // 2) semantic
-    if (!timeSensitive && dbConn != null && startupError == null)
+    // 2) semantic (sadece pgvector varsa)
+    if (!timeSensitive && semanticEnabled && dbConn != null && startupError == null)
     {
         emb = await GetEmbeddingAsync(question);
         if (emb != null)
@@ -571,14 +607,14 @@ app.MapPost("/ask", async (AskRequest req) =>
     {
         var ttl = timeSensitive ? TTL_TIME_SENSITIVE_MIN : TTL_NORMAL_MIN;
 
-        if (!timeSensitive && emb == null)
+        if (!timeSensitive && semanticEnabled && emb == null)
             emb = await GetEmbeddingAsync(question);
 
-        await SaveCachePg(dbConn, qnorm, question, answer, ttl, emb);
+        await SaveCachePg(dbConn, qnorm, question, answer, ttl, emb, semanticEnabled);
     }
 
     sw.Stop();
-    return Results.Ok(new { answer, cached = false, mode = "llm", ms = sw.ElapsedMilliseconds });
+    return Results.Ok(new { answer, cached = false, mode = "llm", semanticEnabled, ms = sw.ElapsedMilliseconds });
 });
 
 app.Run();
