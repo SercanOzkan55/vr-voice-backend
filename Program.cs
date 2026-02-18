@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Routing;
 using Npgsql;
 using System.Diagnostics;
+using Pgvector; // ✅ IMPORTANT: Pgvector NuGet package
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -54,23 +55,32 @@ static bool IsTimeSensitive(string q)
 
 static string GetPgConn()
 {
+    // 1) DATABASE_URL varsa: ya postgres://... ya da direkt connection string olabilir
     var url = Environment.GetEnvironmentVariable("DATABASE_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PUBLIC_URL")
            ?? Environment.GetEnvironmentVariable("DATABASE_PRIVATE_URL");
 
     if (!string.IsNullOrWhiteSpace(url))
     {
-        var uri = new Uri(url);
-        var userInfo = uri.UserInfo.Split(':', 2);
+        // Eğer postgres:// ile başlıyorsa parse et
+        if (url.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
+            url.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
+        {
+            var uri = new Uri(url);
+            var userInfo = uri.UserInfo.Split(':', 2);
 
-        var user = Uri.UnescapeDataString(userInfo[0]);
-        var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
-        var db = uri.AbsolutePath.TrimStart('/');
+            var user = Uri.UnescapeDataString(userInfo[0]);
+            var pass = userInfo.Length > 1 ? Uri.UnescapeDataString(userInfo[1]) : "";
+            var db = uri.AbsolutePath.TrimStart('/');
 
-        return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
+            return $"Host={uri.Host};Port={uri.Port};Database={db};Username={user};Password={pass};Ssl Mode=Require;Trust Server Certificate=true;";
+        }
+
+        // Değilse: user direkt "Host=...;Port=..." gibi koymuş olabilir → aynen kullan
+        return url;
     }
 
-    // PG* fallback
+    // 2) PG* fallback
     var host = Environment.GetEnvironmentVariable("PGHOST");
     var p = Environment.GetEnvironmentVariable("PGPORT") ?? "5432";
     var dbn = Environment.GetEnvironmentVariable("PGDATABASE");
@@ -143,7 +153,11 @@ static async Task<float[]?> GetEmbeddingAsync(string text)
 
     var res = await http.PostAsJsonAsync("https://api.openai.com/v1/embeddings", payload);
     var json = await res.Content.ReadAsStringAsync();
-    if (!res.IsSuccessStatusCode) return null;
+    if (!res.IsSuccessStatusCode)
+    {
+        Console.WriteLine("EMBED_FAIL -> " + res.StatusCode + " " + json);
+        return null;
+    }
 
     using var doc = JsonDocument.Parse(json);
 
@@ -154,6 +168,9 @@ static async Task<float[]?> GetEmbeddingAsync(string text)
         .Select(x => x.GetSingle())
         .ToArray();
 
+    if (emb.Length != EMB_DIM)
+        Console.WriteLine($"EMBED_WARN -> dim={emb.Length} expected={EMB_DIM}");
+
     return emb;
 }
 
@@ -162,7 +179,6 @@ static async Task EnsureDbAsync(string connString)
     await using var conn = new NpgsqlConnection(connString);
     await conn.OpenAsync();
 
-    // pg_trgm (fuzzy) + vector (semantic embedding) extensions
     var sql = $@"
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -180,11 +196,11 @@ CREATE TABLE IF NOT EXISTS qa_cache (
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm ON qa_cache(qnorm);
 CREATE INDEX IF NOT EXISTS idx_qa_cache_expires ON qa_cache(expires_at);
 
--- Fuzzy arama için GIN index
 CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm_trgm ON qa_cache USING gin (qnorm gin_trgm_ops);
 
--- Semantic arama için index (opsiyonel ama iyi)
-CREATE INDEX IF NOT EXISTS idx_qa_cache_embedding ON qa_cache USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- IVFFLAT index: embedding dolmadan da oluşturulabilir (NULL'lar sorun değil)
+CREATE INDEX IF NOT EXISTS idx_qa_cache_embedding
+ON qa_cache USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 ";
     await using var cmd = new NpgsqlCommand(sql, conn);
     await cmd.ExecuteNonQueryAsync();
@@ -246,8 +262,9 @@ LIMIT 1;
             return (null, false, sim, matched);
         }
     }
-    catch
+    catch (Exception ex)
     {
+        Console.WriteLine("TRY_FUZZY_FAIL -> " + ex.Message);
         return (null, false, 0, null);
     }
 }
@@ -261,7 +278,6 @@ TryCachePgSemantic(string connString, string question, float[] emb)
         await using var conn = new NpgsqlConnection(connString);
         await conn.OpenAsync();
 
-        // Önce trigram ile adayları biraz daraltalım (performans + alakasızları azaltır)
         var qnorm = NormalizeQ(question);
 
         var sql = @"
@@ -276,7 +292,7 @@ LIMIT 25;
 ";
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@q", qnorm);
-        cmd.Parameters.AddWithValue("@emb", emb);
+        cmd.Parameters.AddWithValue("@emb", new Vector(emb)); // ✅ correct pgvector param
 
         await using var reader = await cmd.ExecuteReaderAsync();
 
@@ -321,8 +337,9 @@ LIMIT 25;
 
         return (null, false, null, 0, 0, null);
     }
-    catch
+    catch (Exception ex)
     {
+        Console.WriteLine("TRY_SEM_FAIL -> " + ex.Message);
         return (null, false, null, 0, 0, null);
     }
 }
@@ -337,10 +354,8 @@ static async Task SaveCachePg(string connString, string qnorm, string question, 
 
         var expires = DateTime.UtcNow.AddMinutes(ttlMinutes);
 
-        var sql = @"
-INSERT INTO qa_cache (qnorm, question, answer, embedding, expires_at)
-VALUES (@qnorm,@question,@answer,@emb,@expires);
-";
+        var sql = @"INSERT INTO qa_cache (qnorm, question, answer, embedding, expires_at)
+                    VALUES (@qnorm,@question,@answer,@emb,@expires);";
 
         await using var cmd = new NpgsqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@qnorm", qnorm);
@@ -348,12 +363,19 @@ VALUES (@qnorm,@question,@answer,@emb,@expires);
         cmd.Parameters.AddWithValue("@answer", answer);
         cmd.Parameters.AddWithValue("@expires", expires);
 
-        if (emb == null) cmd.Parameters.AddWithValue("@emb", DBNull.Value);
-        else cmd.Parameters.AddWithValue("@emb", emb);
+        if (emb == null)
+            cmd.Parameters.AddWithValue("@emb", DBNull.Value);
+        else
+            cmd.Parameters.AddWithValue("@emb", new Vector(emb)); // ✅ correct
 
         await cmd.ExecuteNonQueryAsync();
+
+        Console.WriteLine($"CACHE_SAVE_OK -> {qnorm} (emb={(emb != null ? "yes" : "no")})");
     }
-    catch { }
+    catch (Exception ex)
+    {
+        Console.WriteLine("CACHE_SAVE_FAIL -> " + ex.Message);
+    }
 }
 
 static async Task<string> AskOpenAI(string question)
@@ -486,7 +508,7 @@ app.MapPost("/ask", async (AskRequest req) =>
 
     float[]? emb = null;
 
-    // 2) Cache: semantic (embedding) + overlap guard
+    // 2) Cache: semantic
     if (!timeSensitive && dbConn != null && startupError == null)
     {
         emb = await GetEmbeddingAsync(question);
@@ -511,16 +533,19 @@ app.MapPost("/ask", async (AskRequest req) =>
         }
     }
 
-    // 3) OpenAI
+    // 3) LLM
     var answer = await AskOpenAI(question);
 
     // 4) Save (embedding ile)
     if (dbConn != null && startupError == null)
     {
-        if (emb == null) emb = await GetEmbeddingAsync(question);
         var ttl = timeSensitive ? TTL_TIME_SENSITIVE_MIN : TTL_NORMAL_MIN;
 
-        _ = SaveCachePg(dbConn, qnorm, question, answer, ttl, emb);
+        // Time-sensitive sorularda embedding çıkarma → token maliyeti azalt
+        if (!timeSensitive && emb == null)
+            emb = await GetEmbeddingAsync(question);
+
+        await SaveCachePg(dbConn, qnorm, question, answer, ttl, emb);
     }
 
     sw.Stop();
