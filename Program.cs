@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Routing;
@@ -8,13 +9,12 @@ using Pgvector;
 using Pgvector.Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
-
 builder.Services.AddCors();
 
 var app = builder.Build();
 app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
-Console.WriteLine("BUILD_MARKER: 2026-02-18_v7_semanticcache_VECTOR_FALLBACK");
+Console.WriteLine("BUILD_MARKER: 2026-02-18_v8_websearch_fixed_FULL");
 
 // Bind to Railway PORT
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
@@ -54,11 +54,11 @@ static string NormalizeQ(string s)
 
 static bool IsTimeSensitive(string q)
 {
-    var x = q.ToLowerInvariant();
+    var x = (q ?? "").ToLowerInvariant();
     string[] keywords =
     {
-        "bugün","yarın","şu an","hava","dolar","euro","kur","haber",
-        "today","tomorrow","now","weather","price","news","latest"
+        "bugün","yarın","şu an","hava","dolar","euro","kur","haber","son dakika","maç","skor",
+        "today","tomorrow","now","weather","price","news","latest","score","match"
     };
     return keywords.Any(k => x.Contains(k));
 }
@@ -107,7 +107,7 @@ static string GetPgConn()
 static NpgsqlDataSource BuildDataSource(string connString)
 {
     var b = new NpgsqlDataSourceBuilder(connString);
-    // client-side mapping; extension olmasa bile problem değil
+    // client-side mapping (extension olmasa bile sorun değil)
     b.UseVector();
     return b.Build();
 }
@@ -192,7 +192,6 @@ static async Task EnsureDbAsync(string connString, Action<bool> setSemanticEnabl
     await using var ds = BuildDataSource(connString);
     await using var conn = await ds.OpenConnectionAsync();
 
-    // Her DB'de çalışacak kısım
     var baseSql = @"
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -212,14 +211,12 @@ CREATE INDEX IF NOT EXISTS idx_qa_cache_qnorm_trgm ON qa_cache USING gin (qnorm 
     await using (var cmd = new NpgsqlCommand(baseSql, conn))
         await cmd.ExecuteNonQueryAsync();
 
-    // Vector var mı?
     var hasVector = await HasVectorAsync(conn);
     setSemanticEnabled(hasVector);
     Console.WriteLine("PGVECTOR_AVAILABLE -> " + hasVector);
 
     if (!hasVector) return;
 
-    // Vector varsa semantic kolon + index
     var vecSql = $@"
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -365,6 +362,56 @@ LIMIT 25;";
     }
 }
 
+// --- Web search via Responses API ---
+static async Task<string?> AskOpenAI_WebSearch(string question)
+{
+    var apiKey = GetOpenAIKey();
+    if (string.IsNullOrWhiteSpace(apiKey)) return null;
+
+    using var http = new HttpClient();
+    http.DefaultRequestHeaders.Authorization =
+        new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+
+    var payload = new
+    {
+        model = "gpt-4o-mini",
+        tools = new object[]
+        {
+            new { type = "web_search", search_context_size = "low" }
+        },
+        input = new object[]
+        {
+            new { role = "system", content = "Türkçe cevap ver. Kısa ve net ol. Web'den bulduğun bilgiye dayan. Uydurma yapma." },
+            new { role = "user", content = question }
+        }
+    };
+
+    var res = await http.PostAsJsonAsync("https://api.openai.com/v1/responses", payload);
+    var json = await res.Content.ReadAsStringAsync();
+
+    if (!res.IsSuccessStatusCode)
+    {
+        Console.WriteLine("WEB_SEARCH_FAIL -> " + res.StatusCode + " " + json);
+        return null;
+    }
+
+    using var doc = JsonDocument.Parse(json);
+    if (!doc.RootElement.TryGetProperty("output", out var output)) return null;
+
+    var sb = new StringBuilder();
+    foreach (var item in output.EnumerateArray())
+    {
+        if (item.TryGetProperty("type", out var t) && t.GetString() == "output_text")
+        {
+            if (item.TryGetProperty("text", out var txt))
+                sb.Append(txt.GetString());
+        }
+    }
+
+    var text = sb.ToString().Trim();
+    return string.IsNullOrWhiteSpace(text) ? null : text;
+}
+
 // --- save ---
 static async Task SaveCachePg(string connString, string qnorm, string question, string answer, int ttlMinutes, float[]? emb, bool semanticEnabled)
 {
@@ -406,7 +453,8 @@ static async Task SaveCachePg(string connString, string qnorm, string question, 
     }
 }
 
-static async Task<string> AskOpenAI(string question)
+// --- Normal chat (no web) ---
+static async Task<string> AskOpenAI_NoWeb(string question)
 {
     var apiKey = GetOpenAIKey();
     if (string.IsNullOrWhiteSpace(apiKey))
@@ -422,7 +470,9 @@ static async Task<string> AskOpenAI(string question)
         {
             new { role = "system", content = "Sen VR içindeki öğretmensin. Cevapları HER ZAMAN Türkçe ver. Kısa ve net ol." },
             new { role = "user", content = question }
-        }
+        },
+        max_tokens = 400,
+        temperature = 0.2
     };
 
     try
@@ -447,6 +497,23 @@ static async Task<string> AskOpenAI(string question)
     }
 }
 
+// --- Main entry for answering ---
+static async Task<string> AskOpenAI(string question)
+{
+    // time-sensitive ise önce web search dene, sonra fallback
+    if (IsTimeSensitive(question))
+    {
+        var webAns = await AskOpenAI_WebSearch(question);
+        if (!string.IsNullOrWhiteSpace(webAns))
+            return webAns;
+
+        // fallback (boş dönmesin)
+        return await AskOpenAI_NoWeb("Kullanıcı canlı veri soruyor (hava/kur/maç/haber). İnternete erişim yoksa uydurma yapma ve dürüstçe söyle: " + question);
+    }
+
+    return await AskOpenAI_NoWeb(question);
+}
+
 /* ---------- STARTUP ---------- */
 try
 {
@@ -464,7 +531,7 @@ catch (Exception ex)
 
 app.MapGet("/", () => "OK");
 app.MapGet("/health", () => Results.Ok(new { ok = true, semanticEnabled }));
-app.MapGet("/version", () => "BUILD_2026_02_18_v7_semanticcache_VECTOR_FALLBACK");
+app.MapGet("/version", () => "BUILD_2026_02_18_v8_websearch_fixed_FULL");
 
 app.MapGet("/routes", (IEnumerable<EndpointDataSource> sources) =>
 {
@@ -514,7 +581,6 @@ app.MapGet("/cache/last", async () =>
     await using var ds = BuildDataSource(dbConn);
     await using var conn = await ds.OpenConnectionAsync();
 
-    // embedding kolonu yoksa patlamasın diye INFORMATION_SCHEMA ile kontrol edelim
     var hasEmbColSql = @"
 SELECT EXISTS(
   SELECT 1
@@ -531,6 +597,7 @@ SELECT EXISTS(
     await using var cmd = new NpgsqlCommand(sql, conn);
     await using var r = await cmd.ExecuteReaderAsync();
     if (!await r.ReadAsync()) return Results.NotFound();
+
     return Results.Ok(new
     {
         id = r.GetInt64(0),
@@ -553,7 +620,7 @@ app.MapPost("/ask", async (AskRequest req) =>
     var qnorm = NormalizeQ(question);
     var timeSensitive = IsTimeSensitive(question);
 
-    // 1) exact + fuzzy
+    // 1) exact + fuzzy (time-sensitive sorularda cache HIT arama yapma)
     if (!timeSensitive && dbConn != null && startupError == null)
     {
         var cached = await TryCachePgExactOrFuzzy(dbConn, qnorm, FUZZY_SIM_THRESHOLD);
@@ -567,6 +634,7 @@ app.MapPost("/ask", async (AskRequest req) =>
                 mode = cached.sim >= 0.999 ? "exact" : "fuzzy",
                 similarity = cached.sim,
                 matched = cached.matchedQnorm,
+                semanticEnabled,
                 ms = sw.ElapsedMilliseconds
             });
         }
@@ -574,7 +642,7 @@ app.MapPost("/ask", async (AskRequest req) =>
 
     float[]? emb = null;
 
-    // 2) semantic (sadece pgvector varsa)
+    // 2) semantic (sadece pgvector varsa, time-sensitive değilse)
     if (!timeSensitive && semanticEnabled && dbConn != null && startupError == null)
     {
         emb = await GetEmbeddingAsync(question);
@@ -593,13 +661,14 @@ app.MapPost("/ask", async (AskRequest req) =>
                     overlap = sem.overlap,
                     matchedQuestion = sem.matchedQuestion,
                     matchedId = sem.id,
+                    semanticEnabled,
                     ms = sw.ElapsedMilliseconds
                 });
             }
         }
     }
 
-    // 3) LLM
+    // 3) LLM (web search dahil)
     var answer = await AskOpenAI(question);
 
     // 4) Save
