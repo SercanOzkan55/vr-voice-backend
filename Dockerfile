@@ -2,17 +2,20 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
 COPY . .
-RUN dotnet publish -c Release -o /app/publish
+RUN dotnet publish -c Release -o /app
 
 # --- runtime ---
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
-WORKDIR /app
 
-# install GSSAPI lib (fix: libgssapi_krb5.so.2)
+# libgssapi_krb5.so.2 -> libkrb5 paketiyle gelir (Debian tabanlı imajlarda)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libgssapi-krb5-2 \
- && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends libkrb5-3 \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /app/publish .
+WORKDIR /app
+COPY --from=build /app .
+
+ENV ASPNETCORE_URLS=http://0.0.0.0:8080
 EXPOSE 8080
+
 ENTRYPOINT ["dotnet", "AiBackend.dll"]
