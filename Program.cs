@@ -391,26 +391,45 @@ static async Task<string?> AskOpenAI_WebSearch(string question)
 
     if (!res.IsSuccessStatusCode)
     {
-        Console.WriteLine("WEB_SEARCH_FAIL -> " + res.StatusCode + " " + json);
+        Console.WriteLine("WEB_SEARCH_FAIL -> " + (int)res.StatusCode + " " + json);
         return null;
     }
 
+    // ✅ DEBUG: ilk 500 karakteri logla ki gerçekten ne dönüyor görelim
+    Console.WriteLine("WEB_SEARCH_OK_JSON_FIRST500 -> " + (json.Length > 500 ? json.Substring(0, 500) : json));
+
     using var doc = JsonDocument.Parse(json);
-    if (!doc.RootElement.TryGetProperty("output", out var output)) return null;
+
+    // Responses API: output -> [ { type:"message", content:[ {type:"output_text", text:"..."} ] } ]
+    if (!doc.RootElement.TryGetProperty("output", out var outputArr) || outputArr.ValueKind != JsonValueKind.Array)
+        return null;
 
     var sb = new StringBuilder();
-    foreach (var item in output.EnumerateArray())
+
+    foreach (var outItem in outputArr.EnumerateArray())
     {
-        if (item.TryGetProperty("type", out var t) && t.GetString() == "output_text")
+        // content array varsa oradan output_text topla
+        if (outItem.TryGetProperty("content", out var contentArr) && contentArr.ValueKind == JsonValueKind.Array)
         {
-            if (item.TryGetProperty("text", out var txt))
-                sb.Append(txt.GetString());
+            foreach (var c in contentArr.EnumerateArray())
+            {
+                if (c.TryGetProperty("type", out var ct) && ct.GetString() == "output_text")
+                {
+                    if (c.TryGetProperty("text", out var txtEl))
+                        sb.Append(txtEl.GetString());
+                }
+            }
         }
+
+        // bazı varyantlarda direkt "text" alanı olabiliyor
+        if (outItem.TryGetProperty("text", out var directText) && directText.ValueKind == JsonValueKind.String)
+            sb.Append(directText.GetString());
     }
 
     var text = sb.ToString().Trim();
     return string.IsNullOrWhiteSpace(text) ? null : text;
 }
+
 
 // --- save ---
 static async Task SaveCachePg(string connString, string qnorm, string question, string answer, int ttlMinutes, float[]? emb, bool semanticEnabled)
